@@ -1,38 +1,31 @@
-.PHONY: build
-VERSION ?=4.10
-# Default image tag
-
-SIDECAR_IMG ?= quay.io/redhat-cne/cloud-event-proxy:release-$(VERSION)
-CONSUMER_IMG ?= quay.io/redhat-cne/cloud-event-consumer:release-$(VERSION)
-
-# Get the currently used golang install path (in GOPATH/bin, unless GOBIN is set)
-ifeq (,$(shell go env GOBIN))
-GOBIN=$(shell go env GOPATH)/bin
-else
-GOBIN=$(shell go env GOBIN)
+IMG ?= quay.io/redhat-cne/cloud-event-consumer:latest
+CONSUMER_IMG ?= $(IMG)
+SECURED ?= true
+DIR_CERTS ?= /tmp/certs
+CERT_MANAGER ?= false
+KUSTOMIZE ?= kustomize
+OVERLAY = manifests
+ifeq ($(SECURED),true)
+OVERLAY = manifests/secured
 endif
 
-# Download kustomize locally if necessary, preferring the $(pwd)/bin path over global if both exist.
-.PHONY: kustomize
-kustomize:
-ifeq (, $(shell which kustomize))
-	@{ \
-	set -e ;\
-	KUSTOMIZE_GEN_TMP_DIR=$$(mktemp -d) ;\
-	cd $$KUSTOMIZE_GEN_TMP_DIR ;\
-	go mod init tmp ;\
-	go get sigs.k8s.io/kustomize/kustomize/v3@v3.5.4 ;\
-	rm -rf $$KUSTOMIZE_GEN_TMP_DIR ;\
-	}
-KUSTOMIZE=$(GOBIN)/kustomize
-else
-KUSTOMIZE=$(shell which kustomize)
+.PHONY: build test docker-build docker-push deploy-consumer deploy-consumer-secured undeploy-consumer
+build:
+	CGO_ENABLED=0 go build -o build/cloud-event-consumer ./cmd/cloud-event-consumer
+test:
+	go test -tags unittests ./...
+docker-build:
+	docker build -t $(CONSUMER_IMG) .
+docker-push:
+	docker push $(CONSUMER_IMG)
+deploy-consumer:
+	cd $(OVERLAY) && $(KUSTOMIZE) edit set image cloud-event-consumer=$(CONSUMER_IMG)
+	$(KUSTOMIZE) build $(OVERLAY) | kubectl apply -f -
+ifeq ($(SECURED),true)
+	DIR_CERTS=$(DIR_CERTS) CERT_MANAGER=$(CERT_MANAGER) bash manifests/auth/setup-secrets.sh
 endif
+deploy-consumer-secured:
+	$(MAKE) deploy-consumer SECURED=true
 
-deploy:kustomize
-	cd ./manifests && $(KUSTOMIZE) edit set image cloud-event-sidecar=${SIDECAR_IMG} && $(KUSTOMIZE) edit set image cloud-event-consumer=${CONSUMER_IMG}
-	$(KUSTOMIZE) build ./manifests | kubectl apply -f -
-
-undeploy:kustomize
-	cd ./manifests && $(KUSTOMIZE) edit set image cloud-event-sidecar=${SIDECAR_IMG} && $(KUSTOMIZE) edit set image cloud-event-consumer=${CONSUMER_IMG}
-	$(KUSTOMIZE) build ./manifests | kubectl delete -f -
+undeploy-consumer:
+	$(KUSTOMIZE) build $(OVERLAY) | kubectl delete --ignore-not-found -f -

@@ -1,18 +1,13 @@
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
+# Plaintext compatibility deployment. `make deploy-consumer SECURED=false` renders this:
+# the cloud-event-consumer talks to the publisher over plain HTTP, exactly as
+# before the mTLS + OAuth work. For the secured (mTLS + OAuth) deployment use
+# `make deploy-consumer SECURED=true` (or `make deploy-consumer-secured`), which
+# renders the ./secured overlay.
 resources:
-- namespace.yaml
-- sa.yaml
-- roles.yaml
-- service.yaml
-- deployment.yaml
-replicas:
-- count: 1
-  name: cloud-event-consumer-deployment
+- base
 images:
 - name: cloud-event-consumer
   newName: quay.io/redhat-cne/cloud-event-consumer
-  newTag: release-4.12
-- name: cloud-event-sidecar
-  newName: quay.io/redhat-cne/cloud-event-proxy
-  newTag: release-4.12
+  newTag: latest
