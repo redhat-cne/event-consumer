@@ -1,6 +1,7 @@
 IMG ?= quay.io/redhat-cne/cloud-event-consumer:latest
 CONSUMER_IMG ?= $(IMG)
-SECURED ?= true
+SECURED ?= false
+CEP_VERSION ?= 2
 DIR_CERTS ?= /tmp/certs
 CERT_MANAGER ?= false
 KUSTOMIZE ?= kustomize
@@ -22,7 +23,7 @@ deploy-consumer:
 	cd $(OVERLAY) && $(KUSTOMIZE) edit set image cloud-event-consumer=$(CONSUMER_IMG)
 	$(KUSTOMIZE) build $(OVERLAY) | kubectl apply -f -
 ifeq ($(SECURED),true)
-	DIR_CERTS=$(DIR_CERTS) CERT_MANAGER=$(CERT_MANAGER) bash manifests/auth/setup-secrets.sh
+	CEP_VERSION=$(CEP_VERSION) DIR_CERTS=$(DIR_CERTS) CERT_MANAGER=$(CERT_MANAGER) bash manifests/auth/setup-secrets.sh
 endif
 deploy-consumer-secured:
 	$(MAKE) deploy-consumer SECURED=true

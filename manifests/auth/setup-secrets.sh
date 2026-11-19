@@ -41,10 +41,16 @@ PUBLISHER_DAEMONSET="${PUBLISHER_DAEMONSET:-linuxptp-daemon}"
 CONSUMER_DEPLOYMENT="${CONSUMER_DEPLOYMENT:-cloud-consumer-deployment}"
 DIR_CERTS="${DIR_CERTS:-/tmp/certs}"
 CERT_MANAGER="${CERT_MANAGER:-false}"
+CEP_VERSION="${CEP_VERSION:-2}"
 TIMEOUT="${TIMEOUT:-60}"
 ROLLOUT_TIMEOUT="${ROLLOUT_TIMEOUT:-180s}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+case "$CEP_VERSION" in
+    1|2) ;;
+    *) echo "Error: CEP_VERSION must be 1 or 2" >&2; exit 1 ;;
+esac
 
 echo "Setting up authentication for cloud-event-consumer"
 echo "  consumer namespace : $NAMESPACE"
@@ -101,9 +107,7 @@ apply_tls_secret() {
     esac
 }
 
-# TLS certificates and trust pools are loaded at process startup. Restart the
-# publisher before the consumer so the publisher trusts the newly provisioned
-# consumer certificate when subscription creation begins.
+# The CEPv1 publisher and standalone consumer load TLS material at startup.
 restart_and_wait() {
     local resource="$1" namespace="$2"
     if ! oc get "$resource" -n "$namespace" >/dev/null 2>&1; then
@@ -276,8 +280,11 @@ data:
 EOF
 echo "✓ consumer-auth-config ConfigMap created"
 
-echo "Restarting secured workloads to load the new certificates and trust bundle..."
-restart_and_wait "daemonset/$PUBLISHER_DAEMONSET" "$PUBLISHER_NAMESPACE"
+if [ "$CEP_VERSION" = "1" ]; then
+    restart_and_wait "daemonset/$PUBLISHER_DAEMONSET" "$PUBLISHER_NAMESPACE"
+else
+    echo "CEPv2 publisher reloads projected TLS material in place; the consumer retries subscriptions during propagation."
+fi
 restart_and_wait "deployment/$CONSUMER_DEPLOYMENT" "$NAMESPACE"
 
 echo ""

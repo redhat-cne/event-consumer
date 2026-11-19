@@ -13,8 +13,8 @@ make docker-build docker-push CONSUMER_IMG=quay.io/your-account/cloud-event-cons
 make deploy-consumer SECURED=true CONSUMER_IMG=quay.io/your-account/cloud-event-consumer:dev
 ```
 
-Upstream deployments default to secured mode. Set SECURED=false explicitly for
-an unsecured compatibility deployment. Use the same JSON options as CEPv1:
+Deployments initially default to plaintext for compatibility. Set SECURED=true
+for full mTLS and OAuth. Use the same JSON options as CEPv1:
 enableMTLS, enableOAuth, requiredAudiences, certificate paths, service account
 token path, tlsMinVersion and tlsCipherSuites. Both enabled mechanisms must pass.
 Client CA material is published to ptp-event-publisher-client-ca; the operator

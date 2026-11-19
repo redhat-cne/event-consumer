@@ -10,11 +10,11 @@ validated through the Kubernetes TokenReview API.
 # Plaintext compatibility mode
 make deploy-consumer SECURED=false
 
-# Secured mode (upstream default)
+# Secured mode with a CEPv2 publisher that supports live TLS reload
 make deploy-consumer SECURED=true
 
-# Remove the secured overlay (use SECURED=false for the plaintext overlay)
-make undeploy-consumer
+# Remove the secured overlay
+make undeploy-consumer SECURED=true
 ```
 
 Secured deployment performs these steps:
@@ -25,6 +25,11 @@ Secured deployment performs these steps:
 4. Writes the client CA to the operator input ConfigMap
    `ptp-event-publisher-client-ca`.
 5. Creates a static authentication ConfigMap using `requiredAudiences`.
+
+The setup defaults to `CEP_VERSION=2` and expects a CEPv2 publisher image with
+live TLS reload. It restarts the consumer Deployment for its own credential
+changes. Subscription retries cover the publisher's volume propagation delay.
+For a CEPv1 publisher, pass `CEP_VERSION=1` to retain the publisher rollout.
 
 There are no cluster-specific OAuth issuer or JWKS URLs. `CLUSTER_NAME` is not
 used to generate authentication settings.
