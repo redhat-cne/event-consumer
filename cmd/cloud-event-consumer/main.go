@@ -1,0 +1,627 @@
+// Copyright 2020 The Cloud Native Events Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package main
+
+import (
+	"bytes"
+	"encoding/json"
+	"flag"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/url"
+	"os"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/google/uuid"
+
+	ce "github.com/cloudevents/sdk-go/v2/event"
+	"github.com/redhat-cne/event-consumer/pkg/auth"
+	"github.com/redhat-cne/event-consumer/pkg/common"
+	"github.com/redhat-cne/event-consumer/pkg/restclient"
+	ptpEvent "github.com/redhat-cne/sdk-go/pkg/event/ptp"
+	redfishEvent "github.com/redhat-cne/sdk-go/pkg/event/redfish"
+	"github.com/redhat-cne/sdk-go/pkg/pubsub"
+	"github.com/redhat-cne/sdk-go/pkg/types"
+	v1pubsub "github.com/redhat-cne/sdk-go/v1/pubsub"
+	log "github.com/sirupsen/logrus"
+)
+
+// ConsumerTypeEnum enum to choose consumer type
+type ConsumerTypeEnum string
+
+var consumerType ConsumerTypeEnum
+
+const (
+	// PTP consumer
+	PTP ConsumerTypeEnum = "PTP"
+	// HW Consumer
+	HW ConsumerTypeEnum = "HW"
+	// MOCK consumer
+	MOCK ConsumerTypeEnum = "MOCK"
+	// HealthCheckInterval interval in seconds to ping publisher API health status
+	HealthCheckInterval = 30
+	// HealthCheckRetryInterval for each ping to publisher API health status, retry at this interval in seconds
+	HealthCheckRetryInterval = 2
+	// eventPullInterval interval in seconds for pulling events
+	eventPullInterval = 60
+	defaultAPIAddr    = "localhost:8089"
+)
+
+var (
+	apiAddr            string
+	apiPath            = "/api/ocloudNotifications/v2/"
+	apiVersion         string
+	localAPIAddr       = "localhost:8989"
+	resourcePrefix     = "/cluster/node/%s%s"
+	mockResource       = "/mock"
+	mockResourceKey    = "mock"
+	httpEventPublisher string
+	authConfigPath     string
+	// map to track if subscriptions were created successfully for each publisher service
+	subscribed = make(map[string]bool)
+	subs       []*pubsub.PubSub
+	// Git commit of current build set at build time
+	GitCommit = "Undefined"
+	// Global authenticated REST client
+	authenticatedClient *restclient.Rest
+	// Global authentication configuration
+	authConfig *auth.AuthConfig
+	// callbackTokenValidator validates bearer tokens presented by the publisher
+	// when it pushes events to this consumer's callback endpoints (OAuth mode).
+	callbackTokenValidator auth.TokenValidator
+)
+
+func main() {
+	fmt.Printf("Git commit: %s\n", GitCommit)
+	common.InitLogger()
+	flag.StringVar(&localAPIAddr, "local-api-addr", "localhost:8989", "The address the local api binds to .")
+	flag.StringVar(&apiPath, "api-path", "/api/ocloudNotifications/v2/", "The rest api path.")
+	flag.StringVar(&apiAddr, "api-addr", "", "Obsolete. The publisher API address is retrieved from httpEventPublisher flag")
+	flag.StringVar(&apiVersion, "api-version", "", "Obsolete. The version of event REST API is set to 2.0.")
+	flag.StringVar(&httpEventPublisher, "http-event-publishers", "", "Comma separated address of the publishers available.")
+	flag.StringVar(&authConfigPath, "auth-config", "", "Path to authentication configuration file (JSON format).")
+	flag.Parse()
+
+	if apiAddr != "" {
+		log.Warn("api-addr flag is obsolete. Publisher API address is retrieved from httpEventPublisher flag")
+	}
+
+	if apiVersion != "" {
+		log.Warn("api-version flag is obsolete. Event REST API version is set to 2.0")
+	}
+
+	// Initialize authentication
+	if err := initializeAuthentication(); err != nil {
+		log.Fatalf("Failed to initialize authentication: %v", err)
+	}
+
+	nodeIP := os.Getenv("NODE_IP")
+	nodeName := os.Getenv("NODE_NAME")
+	if nodeName == "" {
+		log.Error("cannot find NODE_NAME environment variable,setting to default `mock` node")
+		nodeName = mockResourceKey
+	}
+
+	enableEventPull := common.GetBoolEnv("ENABLE_STATUS_CHECK")
+
+	consumerTypeEnv := os.Getenv("CONSUMER_TYPE")
+	if consumerTypeEnv == "" {
+		consumerType = MOCK
+	} else {
+		consumerType = ConsumerTypeEnum(consumerTypeEnv)
+	}
+
+	// get the first publisher and replace the apiAddr
+	apiAddr = getFirstHTTPPublishers(nodeIP, nodeName, httpEventPublisher)
+	if apiAddr == "" {
+		log.Errorf("cannot find publisher, setting to default address %s", defaultAPIAddr)
+		apiAddr = defaultAPIAddr
+	}
+	log.Infof("updated apiAddr=%s, apiPath=%s", apiAddr, apiPath)
+
+	subscribeTo := initSubscribers(consumerType)
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go server() // spin local api
+	time.Sleep(5 * time.Second)
+
+	for _, resource := range subscribeTo {
+		subs = append(subs, &pubsub.PubSub{
+			ID:       getUUID(fmt.Sprintf(resourcePrefix, nodeName, resource)).String(),
+			Resource: fmt.Sprintf(resourcePrefix, nodeName, resource),
+		})
+	}
+
+	updateHTTPPublishers(nodeIP, nodeName, httpEventPublisher)
+	subscribeToEvents()
+
+	// ping publisher API health status
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for range time.Tick(HealthCheckInterval * time.Second) {
+			subscribeToEvents()
+		}
+	}()
+
+	// if enabled, pull events periodically
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if enableEventPull {
+			time.Sleep(5 * time.Second)
+			pullEvents()
+			for range time.Tick(eventPullInterval * time.Second) {
+				pullEvents()
+			}
+		}
+	}()
+
+	log.Info("waiting for events")
+	wg.Wait()
+	deleteAllSubscriptions()
+	time.Sleep(3 * time.Second)
+}
+
+// initializeAuthentication initializes the authentication configuration and client
+func initializeAuthentication() error {
+	if authConfigPath == "" {
+		log.Info("No authentication configuration provided, using basic HTTP client")
+		authenticatedClient = restclient.New()
+		authConfig = nil
+		return nil
+	}
+
+	// Load authentication configuration
+	var err error
+	authConfig, err = auth.LoadAuthConfig(authConfigPath)
+	if err != nil {
+		return fmt.Errorf("failed to load authentication configuration: %v", err)
+	}
+
+	// Print authentication configuration summary
+	log.Info(authConfig.GetConfigSummary())
+
+	// Create authenticated REST client
+	authenticatedClient, err = restclient.NewAuthenticated(authConfig)
+	if err != nil {
+		return fmt.Errorf("failed to create authenticated REST client: %v", err)
+	}
+
+	// When OAuth is enabled the publisher pushes events to this consumer's
+	// callback carrying a bearer token; build the validator that verifies it via
+	// the Kubernetes TokenReview API. The consumer ServiceAccount must be bound
+	// to system:auth-delegator (see manifests/auth/rbac.yaml).
+	if authConfig.EnableOAuth {
+		callbackTokenValidator, err = auth.NewTokenReviewValidator()
+		if err != nil {
+			return fmt.Errorf("failed to create TokenReview validator for callback authentication: %v", err)
+		}
+	}
+
+	log.Info("Authentication initialized successfully")
+	return nil
+}
+
+// callbackAuthMiddleware enforces on the consumer's inbound callback endpoints
+// (/event, /ack/event) the same authentication the publisher enforces on its
+// APIs: a same-pod loopback caller is trusted, otherwise every enabled mechanism
+// must pass - a verified client certificate when mTLS is enabled and a valid
+// bearer token (Kubernetes TokenReview) when OAuth is enabled. This closes the
+// O-RAN CR-0003 clause 4.1.1 gap for a consumer in a separate POD/VM: the pushed
+// CloudEvent is authenticated, not merely transported over TLS. It mirrors
+// rest-api's combinedAuthMiddleware, so CreateServerTLSConfig can keep
+// VerifyClientCertIfGiven (allowing OAuth-only and loopback) while presented
+// certificates are still required here when mTLS is on.
+func callbackAuthMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		// No authentication configured: plain-HTTP callback, pass through.
+		if authConfig == nil || (!authConfig.EnableMTLS && !authConfig.EnableOAuth) {
+			next.ServeHTTP(w, req)
+			return
+		}
+		// Trusted loopback fast-path (same-pod producer self-call).
+		if isLoopbackRemoteAddr(req.RemoteAddr) {
+			next.ServeHTTP(w, req)
+			return
+		}
+		// mTLS: require a client certificate the TLS handshake already verified
+		// against the configured CA pool.
+		if authConfig.EnableMTLS {
+			if req.TLS == nil || len(req.TLS.VerifiedChains) == 0 {
+				log.Warnf("mTLS required but no client certificate provided for %s", req.URL.Path)
+				http.Error(w, "Client certificate required", http.StatusUnauthorized)
+				return
+			}
+		}
+		// OAuth: require and validate a bearer token.
+		if authConfig.EnableOAuth {
+			authHeader := req.Header.Get("Authorization")
+			if !strings.HasPrefix(authHeader, "Bearer ") {
+				log.Warnf("OAuth required but no bearer token provided for %s", req.URL.Path)
+				http.Error(w, "Bearer token required", http.StatusUnauthorized)
+				return
+			}
+			token := strings.TrimSpace(strings.TrimPrefix(authHeader, "Bearer "))
+			// Fail closed: OAuth is enabled but no validator was installed.
+			if callbackTokenValidator == nil {
+				log.Error("OAuth enabled but no TokenReview validator configured; rejecting callback")
+				http.Error(w, "token validation unavailable", http.StatusUnauthorized)
+				return
+			}
+			if _, err := callbackTokenValidator.ValidateToken(req.Context(), token, authConfig.RequiredAudiences); err != nil {
+				log.Warnf("OAuth token validation failed for %s: %v", req.URL.Path, err)
+				http.Error(w, "Invalid OAuth token", http.StatusUnauthorized)
+				return
+			}
+		}
+		next.ServeHTTP(w, req)
+	})
+}
+
+// isLoopbackRemoteAddr reports whether an http.Request RemoteAddr is a loopback
+// address (a same-pod caller), which is trusted and exempt from callback auth.
+func isLoopbackRemoteAddr(remoteAddr string) bool {
+	host, _, err := net.SplitHostPort(remoteAddr)
+	if err != nil {
+		host = remoteAddr
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+// getScheme returns the appropriate URL scheme based on authentication configuration.
+// HTTPS is required whenever a credential is sent on the wire: mTLS presents a client
+// certificate, and OAuth sends a bearer token that must never traverse cleartext HTTP
+// (CWE-319). Returning "http" only when no authentication is configured.
+func getScheme() string {
+	if authConfig != nil && (authConfig.EnableMTLS || authConfig.EnableOAuth) {
+		return "https"
+	}
+	return "http"
+}
+
+func deleteAllSubscriptions() {
+	deleteURL := &types.URI{URL: url.URL{Scheme: getScheme(),
+		Host: apiAddr,
+		Path: apiPath + "subscriptions"}}
+	authenticatedClient.Delete(deleteURL)
+	for p := range subscribed {
+		subscribed[p] = false
+	}
+}
+
+// checkSubscriptions gets all subscriptions
+// and returns true if there are any subscriptions
+func checkSubscriptions() bool {
+	url := &types.URI{URL: url.URL{Scheme: getScheme(),
+		Host: apiAddr,
+		Path: apiPath + "subscriptions"}}
+
+	var subs = []pubsub.PubSub{}
+	var subB []byte
+	status, subB, err := authenticatedClient.Get(url)
+	if status != http.StatusOK {
+		log.Errorf("failed to list subscriptions, status %d", status)
+		if err != nil {
+			log.Error(err)
+		}
+		return false
+	}
+	if err = json.Unmarshal(subB, &subs); err != nil {
+		log.Errorf("failed to unmarshal subscriptions, %v", err)
+		return false
+	}
+	return len(subs) > 0
+}
+
+func subscribeToEvents() {
+RETRY:
+	for p, subOK := range subscribed {
+		healthOK := publisherHealthCheck(p)
+		if subOK {
+			if !healthOK {
+				deleteAllSubscriptions()
+				log.Info("delete all subscriptions due to publisher health failure")
+				goto RETRY
+			}
+			if !checkSubscriptions() {
+				// re-subscribe in case of non-recoverable error at server side, for example
+				// lost of persist data in configmap
+				log.Infof("subscription not found for %s, resubscribe", p)
+				subscribed[p] = false
+				goto RETRY
+			}
+			continue
+		}
+		if !healthOK {
+			continue
+		}
+		allSubscribed := true
+		for _, s := range subs {
+			su, status, e := createSubscription(s.Resource)
+			if status == http.StatusConflict {
+				// if subscription for the resource already exist, current O-RAN REST API
+				// does not return subscription info. In order to find out which subscription
+				// has this resource we have to retrieve all subscriptions and search against
+				// the resource to find out the subscription ID.
+				// Delete all subscriptions and resubscribe to keep the example code simple.
+				log.Warnf("%s", e)
+				log.Infof("Delete and resubscribe")
+				deleteAllSubscriptions()
+				goto RETRY
+			} else if e != nil {
+				log.Errorf("failed to create subscription: %v", e)
+				allSubscribed = false
+			} else {
+				log.Infof("created subscription: %s", su.String())
+				s.URILocation = su.URILocation
+				s.ID = su.ID
+			}
+		}
+		if allSubscribed {
+			log.Info("all subscriptions created successfully")
+			subscribed[p] = true
+		}
+	}
+}
+
+func createSubscription(resourceAddress string) (sub pubsub.PubSub, status int, err error) {
+	subURL := &types.URI{URL: url.URL{Scheme: getScheme(),
+		Host: apiAddr,
+		Path: apiPath + "subscriptions"}}
+	// Register the callback EndpointURI with the same scheme used for outbound
+	// calls: https:// when authentication is enabled. Per O-RAN CR-0003 clause
+	// 4.1.1 a callback reachable from a separate POD/VM must be protected by an
+	// authorization mechanism (clause 3.2); registering a plaintext http://
+	// callback would have the producer push event data in the clear (CWE-319)
+	// and accept unauthenticated, spoofable events.
+	endpointURL := &types.URI{URL: url.URL{Scheme: getScheme(),
+		Host: localAPIAddr,
+		Path: "event"}}
+
+	sub = v1pubsub.NewPubSub(endpointURL, resourceAddress)
+	var subB []byte
+
+	if subB, err = json.Marshal(&sub); err == nil {
+		status, subB = authenticatedClient.PostWithReturn(subURL, subB)
+		if status == http.StatusCreated {
+			err = json.Unmarshal(subB, &sub)
+		} else {
+			err = fmt.Errorf("api at %s returned status %d for %s", subURL, status, resourceAddress)
+			if status == http.StatusConflict {
+				return
+			}
+		}
+	} else {
+		err = fmt.Errorf("failed to marshal subscription for %s", resourceAddress)
+	}
+	return
+}
+
+// getCurrentState get event state for the resource
+func getCurrentState(resource string) error {
+	//create publisher
+	url := &types.URI{URL: url.URL{Scheme: getScheme(),
+		Host: apiAddr,
+		Path: fmt.Sprintf("%s%s", apiPath, fmt.Sprintf("%s/CurrentState", resource[1:]))}}
+	status, cloudEvent, err := authenticatedClient.Get(url)
+	if status != http.StatusOK {
+		if err != nil {
+			log.Error(err)
+		}
+		return fmt.Errorf("CurrentState: error %d from url %s", status, url.String())
+	} else {
+		log.Debugf("Got CurrentState:\n%s", prettyEventJSON(cloudEvent))
+	}
+	return nil
+}
+
+// Consumer webserver
+func server() {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/event", getEvent)
+	mux.HandleFunc("/ack/event", ackEvent)
+
+	port := extractPort(localAPIAddr)
+	server := &http.Server{
+		Addr:              port,
+		ReadHeaderTimeout: 3 * time.Second,
+		// Authenticate pushed callbacks (mTLS client cert and/or OAuth bearer
+		// token) when auth is enabled; a no-op pass-through otherwise.
+		Handler: callbackAuthMiddleware(mux),
+	}
+
+	// When authentication is enabled the callback EndpointURI is registered as
+	// https:// (see getScheme/createSubscription), so the local /event server
+	// must terminate TLS and authenticate the pushing producer. This mirrors the
+	// control/pull path and closes the CR-0003 clause 4.1.1 gap for consumers in
+	// a separate POD/VM.
+	if getScheme() == "https" {
+		tlsConfig, err := authConfig.CreateServerTLSConfig()
+		if err != nil {
+			log.Fatalf("failed to create TLS config for callback server: %v", err)
+		}
+		server.TLSConfig = tlsConfig
+		log.Infof("Starting local API (HTTPS, mTLS) listening to %s", port)
+		// Certs are supplied via server.TLSConfig.Certificates.
+		if err = server.ListenAndServeTLS("", ""); err != nil {
+			log.Errorf("error creating event server %s", err)
+		}
+		return
+	}
+
+	log.Infof("Starting local API listening to %s", port)
+	if err := server.ListenAndServe(); err != nil {
+		log.Errorf("error creating event server %s", err)
+	}
+}
+
+func getEvent(w http.ResponseWriter, req *http.Request) {
+	defer req.Body.Close()
+	bodyBytes, err := io.ReadAll(req.Body)
+	if err != nil {
+		log.Errorf("error reading event %v", err)
+	}
+	e := string(bodyBytes)
+	if e != "" {
+		if err = processEvent(bodyBytes); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func ackEvent(w http.ResponseWriter, req *http.Request) {
+	defer req.Body.Close()
+	bodyBytes, err := io.ReadAll(req.Body)
+	if err != nil {
+		log.Errorf("error reading acknowledgment  %v", err)
+	}
+	e := string(bodyBytes)
+	if e != "" {
+		log.Infof("received ack %s", string(bodyBytes))
+	} else {
+		w.WriteHeader(http.StatusNoContent)
+	}
+}
+
+func prettyEventJSON(data []byte) string {
+	var pretty bytes.Buffer
+	trimmed := bytes.TrimSpace(data)
+	if err := json.Indent(&pretty, trimmed, "", "  "); err != nil {
+		return string(data)
+	}
+	return pretty.String()
+}
+
+func processEvent(data []byte) error {
+	var e ce.Event
+	if err := json.Unmarshal(data, &e); err != nil {
+		log.Errorf("failed to unmarshal event, %v", err)
+		return err
+	}
+	// Microsecond resolution: the publisher->consumer hop is in-node (localhost)
+	// on an SNO, so per-event auth overhead is sub-millisecond and invisible at
+	// ms granularity. Log µs (and keep a ms figure for readability) so the
+	// baseline-vs-mTLS/OAuth A/B delta is measurable.
+	latencyUs := time.Now().UnixMicro() - e.Context.GetTime().UnixMicro()
+	// set log to Info level for performance measurement
+	log.Infof("Latency for the event: %d us (%.3f ms)", latencyUs, float64(latencyUs)/1000.0)
+	log.Infof("received event %s: '%s'", e.ID(), prettyEventJSON(data))
+	return nil
+}
+
+func initSubscribers(cType ConsumerTypeEnum) map[string]string {
+	subscribeTo := make(map[string]string)
+	switch cType {
+	case PTP:
+		subscribeTo[string(ptpEvent.OsClockSyncStateChange)] = string(ptpEvent.OsClockSyncState)
+		subscribeTo[string(ptpEvent.PtpClockClassChange)] = string(ptpEvent.PtpClockClass)
+		subscribeTo[string(ptpEvent.PtpStateChange)] = string(ptpEvent.PtpLockState)
+		subscribeTo[string(ptpEvent.GnssStateChange)] = string(ptpEvent.GnssSyncStatus)
+		subscribeTo[string(ptpEvent.SyncStateChange)] = string(ptpEvent.SyncStatusState)
+	case MOCK:
+		subscribeTo[mockResourceKey] = mockResource
+	case HW:
+		subscribeTo[string(redfishEvent.Alert)] = string(redfishEvent.Systems)
+		subscribeTo[string(redfishEvent.ResourceAdded)] = string(redfishEvent.Systems)
+		subscribeTo[string(redfishEvent.ResourceUpdated)] = string(redfishEvent.Systems)
+		subscribeTo[string(redfishEvent.ResourceRemoved)] = string(redfishEvent.Systems)
+		subscribeTo[string(redfishEvent.StatusChange)] = string(redfishEvent.Systems)
+	default:
+		subscribeTo[mockResourceKey] = mockResource
+	}
+	return subscribeTo
+}
+
+func getUUID(s string) uuid.UUID {
+	var namespace = uuid.NameSpaceURL
+	var url = []byte(s)
+	return uuid.NewMD5(namespace, url)
+}
+
+func pullEvents() {
+	for _, subOK := range subscribed {
+		if !subOK {
+			log.Info("skipping getCurrentState() since publisher not available")
+			return
+		}
+	}
+	for _, s := range subs {
+		if err := getCurrentState(s.Resource); err != nil {
+			log.Error(err)
+		}
+	}
+}
+
+func publisherHealthCheck(apiAddr string) bool {
+	healthURL := &types.URI{URL: url.URL{Scheme: getScheme(),
+		Host: apiAddr,
+		Path: apiPath + "health"}}
+
+	// Use authenticated client for health checks when authentication is enabled
+	for i := 0; i <= 5; i++ {
+		log.Infof("health check %s", healthURL.String())
+		status, _, err := authenticatedClient.Get(healthURL)
+		if err != nil {
+			log.Warnf("try %d, return health check of the rest service for error %v", i, err)
+			time.Sleep(HealthCheckRetryInterval * time.Second)
+			continue
+		}
+		if status == http.StatusOK {
+			log.Info("rest service returned healthy status")
+			return true
+		}
+		log.Warnf("try %d, health check returned status %d", i, status)
+		time.Sleep(HealthCheckRetryInterval * time.Second)
+	}
+	return false
+}
+
+func updateHTTPPublishers(nodeIP, nodeName string, addr ...string) {
+	for _, s := range addr {
+		if s == "" {
+			continue
+		}
+		publisherServiceName := common.SanitizeTransportHost(s, nodeIP, nodeName)
+		subscribed[publisherServiceName] = false
+		log.Infof("publisher endpoint updated from %s to %s", s, publisherServiceName)
+	}
+}
+
+func getFirstHTTPPublishers(nodeIP, nodeName string, addr ...string) string {
+	for _, s := range addr {
+		if s == "" {
+			continue
+		}
+		return common.SanitizeTransportHost(s, nodeIP, nodeName)
+	}
+	return ""
+}
+
+// extract port from host:port and make sure to support ipv6
+func extractPort(hostPort string) string {
+	_, port, err := net.SplitHostPort(hostPort)
+	if err != nil {
+		return ""
+	}
+	return ":" + port
+}
