@@ -37,9 +37,12 @@ NAMESPACE="${NAMESPACE:-cloud-events}"
 PUBLISHER_NAMESPACE="${PUBLISHER_NAMESPACE:-openshift-ptp}"
 CLIENT_CA_CONFIGMAP="${CLIENT_CA_CONFIGMAP:-ptp-event-publisher-client-ca}"
 PUBLISHER_CLIENT_SECRET="${PUBLISHER_CLIENT_SECRET:-ptp-event-publisher-client-tls}"
+PUBLISHER_DAEMONSET="${PUBLISHER_DAEMONSET:-linuxptp-daemon}"
+CONSUMER_DEPLOYMENT="${CONSUMER_DEPLOYMENT:-cloud-consumer-deployment}"
 DIR_CERTS="${DIR_CERTS:-/tmp/certs}"
 CERT_MANAGER="${CERT_MANAGER:-false}"
 TIMEOUT="${TIMEOUT:-60}"
+ROLLOUT_TIMEOUT="${ROLLOUT_TIMEOUT:-180s}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -69,6 +72,46 @@ wait_for() {
     done
     echo "Error: timed out waiting for $desc"
     return 1
+}
+
+# apply_tls_secret preserves the immutable type of an existing Secret while
+# updating its tls.crt and tls.key data. Older deployments may already have an
+# Opaque placeholder; Secret volumes and crypto/tls use the data keys, not the
+# Kubernetes type. New Secrets use kubernetes.io/tls.
+apply_tls_secret() {
+    local name="$1" namespace="$2" cert_file="$3" key_file="$4"
+    local existing_type
+    existing_type="$(oc get secret "$name" -n "$namespace" -o jsonpath='{.type}' 2>/dev/null || true)"
+
+    case "$existing_type" in
+        ""|kubernetes.io/tls)
+            oc create secret tls "$name" \
+                --cert="$cert_file" --key="$key_file" \
+                --namespace="$namespace" --dry-run=client -o yaml | oc apply -f -
+            ;;
+        Opaque)
+            oc create secret generic "$name" \
+                --from-file=tls.crt="$cert_file" --from-file=tls.key="$key_file" \
+                --namespace="$namespace" --dry-run=client -o yaml | oc apply -f -
+            ;;
+        *)
+            echo "Error: refusing to replace unsupported Secret type '$existing_type' for $namespace/$name" >&2
+            return 1
+            ;;
+    esac
+}
+
+# TLS certificates and trust pools are loaded at process startup. Restart the
+# publisher before the consumer so the publisher trusts the newly provisioned
+# consumer certificate when subscription creation begins.
+restart_and_wait() {
+    local resource="$1" namespace="$2"
+    if ! oc get "$resource" -n "$namespace" >/dev/null 2>&1; then
+        echo "Warning: $namespace/$resource not found; skipping TLS reload."
+        return 0
+    fi
+    oc rollout restart "$resource" -n "$namespace"
+    oc rollout status "$resource" -n "$namespace" --timeout="$ROLLOUT_TIMEOUT"
 }
 
 ########################################
@@ -146,9 +189,8 @@ else
     openssl x509 -req -in "$DIR_CERTS/client.csr" \
         -CA "$DIR_CERTS/client-ca.crt" -CAkey "$DIR_CERTS/client-ca.key" -CAcreateserial \
         -out "$DIR_CERTS/client.crt" -days 365 -extfile "$ext" >/dev/null 2>&1
-    oc create secret tls consumer-client-certs \
-        --cert="$DIR_CERTS/client.crt" --key="$DIR_CERTS/client.key" \
-        --namespace="$NAMESPACE" --dry-run=client -o yaml | oc apply -f -
+    apply_tls_secret consumer-client-certs "$NAMESPACE" \
+        "$DIR_CERTS/client.crt" "$DIR_CERTS/client.key"
     CLIENT_CA_PEM="$(cat "$DIR_CERTS/client-ca.crt")"
     echo "✓ consumer-client-certs secret created (openssl)"
 
@@ -173,14 +215,12 @@ if oc get namespace "$PUBLISHER_NAMESPACE" >/dev/null 2>&1; then
     if [ "$CERT_MANAGER" = "true" ]; then
         PUBLISHER_CLIENT_CERT="$(oc get secret publisher-client-certs -n "$NAMESPACE" -o jsonpath='{.data.tls\.crt}' | base64 -d)"
         PUBLISHER_CLIENT_KEY="$(oc get secret publisher-client-certs -n "$NAMESPACE" -o jsonpath='{.data.tls\.key}' | base64 -d)"
-        oc create secret tls "$PUBLISHER_CLIENT_SECRET" \
-            --cert=<(printf '%s' "$PUBLISHER_CLIENT_CERT") \
-            --key=<(printf '%s' "$PUBLISHER_CLIENT_KEY") \
-            --namespace="$PUBLISHER_NAMESPACE" --dry-run=client -o yaml | oc apply -f -
+        apply_tls_secret "$PUBLISHER_CLIENT_SECRET" "$PUBLISHER_NAMESPACE" \
+            <(printf '%s' "$PUBLISHER_CLIENT_CERT") \
+            <(printf '%s' "$PUBLISHER_CLIENT_KEY")
     else
-        oc create secret tls "$PUBLISHER_CLIENT_SECRET" \
-            --cert="$DIR_CERTS/publisher-client.crt" --key="$DIR_CERTS/publisher-client.key" \
-            --namespace="$PUBLISHER_NAMESPACE" --dry-run=client -o yaml | oc apply -f -
+        apply_tls_secret "$PUBLISHER_CLIENT_SECRET" "$PUBLISHER_NAMESPACE" \
+            "$DIR_CERTS/publisher-client.crt" "$DIR_CERTS/publisher-client.key"
     fi
     echo "✓ $PUBLISHER_CLIENT_SECRET published for authenticated push callbacks"
 else
@@ -235,6 +275,10 @@ data:
     }
 EOF
 echo "✓ consumer-auth-config ConfigMap created"
+
+echo "Restarting secured workloads to load the new certificates and trust bundle..."
+restart_and_wait "daemonset/$PUBLISHER_DAEMONSET" "$PUBLISHER_NAMESPACE"
+restart_and_wait "deployment/$CONSUMER_DEPLOYMENT" "$NAMESPACE"
 
 echo ""
 echo "Authentication setup completed successfully."
