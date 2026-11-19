@@ -59,6 +59,19 @@ func TestCallbackRequiresEnabledCredentials(t *testing.T) {
 	}
 }
 
+func TestPrettyEventJSON(t *testing.T) {
+	raw := []byte(` {"specversion":"1.0","id":"event-1","data":{"value":42}} `)
+	want := "{\n  \"specversion\": \"1.0\",\n  \"id\": \"event-1\",\n  \"data\": {\n    \"value\": 42\n  }\n}"
+	if got := prettyEventJSON(raw); got != want {
+		t.Fatalf("pretty event:\n%s\nwant:\n%s", got, want)
+	}
+
+	invalid := []byte("not-json")
+	if got := prettyEventJSON(invalid); got != string(invalid) {
+		t.Fatalf("invalid JSON changed: %q", got)
+	}
+}
+
 // CEPv2 uses the same O-RAN v2 subscription wire contract as CEPv1.
 func TestCEPv2SubscriptionWireCompatibility(t *testing.T) {
 	const resource = "/cluster/node/test/sync/ptp-status/lock-state"

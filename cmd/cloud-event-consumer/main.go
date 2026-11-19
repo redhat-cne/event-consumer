@@ -15,6 +15,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -427,7 +428,7 @@ func getCurrentState(resource string) error {
 		}
 		return fmt.Errorf("CurrentState: error %d from url %s", status, url.String())
 	} else {
-		log.Debugf("Got CurrentState: %s ", string(cloudEvent))
+		log.Debugf("Got CurrentState:\n%s", prettyEventJSON(cloudEvent))
 	}
 	return nil
 }
@@ -480,7 +481,6 @@ func getEvent(w http.ResponseWriter, req *http.Request) {
 	}
 	e := string(bodyBytes)
 	if e != "" {
-		log.Infof("received event %s", string(bodyBytes))
 		if err = processEvent(bodyBytes); err != nil {
 			w.WriteHeader(http.StatusBadRequest)
 			return
@@ -503,6 +503,15 @@ func ackEvent(w http.ResponseWriter, req *http.Request) {
 	}
 }
 
+func prettyEventJSON(data []byte) string {
+	var pretty bytes.Buffer
+	trimmed := bytes.TrimSpace(data)
+	if err := json.Indent(&pretty, trimmed, "", "  "); err != nil {
+		return string(data)
+	}
+	return pretty.String()
+}
+
 func processEvent(data []byte) error {
 	var e ce.Event
 	if err := json.Unmarshal(data, &e); err != nil {
@@ -516,7 +525,7 @@ func processEvent(data []byte) error {
 	latencyUs := time.Now().UnixMicro() - e.Context.GetTime().UnixMicro()
 	// set log to Info level for performance measurement
 	log.Infof("Latency for the event: %d us (%.3f ms)", latencyUs, float64(latencyUs)/1000.0)
-	log.Infof("Event: %s", e.String())
+	log.Infof("received event %s: '%s'", e.ID(), prettyEventJSON(data))
 	return nil
 }
 
