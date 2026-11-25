@@ -138,8 +138,11 @@ func (r *Rest) Post(url *types.URI, data []byte) (int, error) {
 
 // PostWithReturn post with data and return data
 func (r *Rest) PostWithReturn(url *types.URI, data []byte) (int, []byte) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	return r.PostWithReturnContext(context.Background(), url, data)
+}
+
+// PostWithReturnContext sends a POST and returns the status and response body.
+func (r *Rest) PostWithReturnContext(ctx context.Context, url *types.URI, data []byte) (int, []byte) {
 	request, err := http.NewRequestWithContext(ctx, "POST", url.String(), bytes.NewBuffer(data))
 	if err != nil {
 		log.Errorf("error creating post with return: %v", err)
@@ -203,8 +206,11 @@ func (r *Rest) Put(url *types.URI) int {
 
 // Delete  http request
 func (r *Rest) Delete(url *types.URI) int {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	return r.DeleteContext(context.Background(), url)
+}
+
+// DeleteContext sends a DELETE and returns the response status.
+func (r *Rest) DeleteContext(ctx context.Context, url *types.URI) int {
 	request, err := http.NewRequestWithContext(ctx, "DELETE", url.String(), nil)
 	if err != nil {
 		log.Errorf("error creating delete request: %v", err)
@@ -229,8 +235,11 @@ func (r *Rest) Delete(url *types.URI) int {
 
 // Get  http request
 func (r *Rest) Get(url *types.URI) (int, []byte, error) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	return r.GetContext(context.Background(), url)
+}
+
+// GetContext sends a GET and returns the status and response body.
+func (r *Rest) GetContext(ctx context.Context, url *types.URI) (int, []byte, error) {
 	request, err := http.NewRequestWithContext(ctx, "GET", url.String(), nil)
 	if err != nil {
 		return http.StatusBadRequest, nil, fmt.Errorf("error creating get request: %v", err)

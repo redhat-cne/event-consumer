@@ -16,6 +16,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -25,8 +26,9 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/signal"
 	"strings"
-	"sync"
+	"syscall"
 	"time"
 
 	"github.com/google/uuid"
@@ -75,9 +77,11 @@ var (
 	httpEventPublisher string
 	authConfigPath     string
 	multilineEvents    bool
-	// map to track if subscriptions were created successfully for each publisher service
+	// subscribed tracks whether all requested subscriptions exist for each
+	// publisher Service (typically one Service per node in CEPv2).
 	subscribed = make(map[string]bool)
-	subs       []*pubsub.PubSub
+	// subs tracks the individual event resources and their subscription IDs.
+	subs []*pubsub.PubSub
 	// Git commit of current build set at build time
 	GitCommit = "Undefined"
 	// Global authenticated REST client
@@ -143,11 +147,6 @@ func main() {
 	log.Infof("updated apiAddr=%s, apiPath=%s", apiAddr, apiPath)
 
 	subscribeTo := initSubscribers(consumerType)
-	var wg sync.WaitGroup
-	wg.Add(1)
-	go server() // spin local api
-	time.Sleep(5 * time.Second)
-
 	for _, resource := range subscribeTo {
 		subs = append(subs, &pubsub.PubSub{
 			ID:       getUUID(fmt.Sprintf(resourcePrefix, nodeName, resource)).String(),
@@ -156,34 +155,58 @@ func main() {
 	}
 
 	updateHTTPPublishers(nodeIP, nodeName, httpEventPublisher)
-	subscribeToEvents()
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
-	// ping publisher API health status
-	wg.Add(1)
+	server, err := newCallbackServer()
+	if err != nil {
+		log.Fatal(err)
+	}
+	listener, err := net.Listen("tcp", server.Addr)
+	if err != nil {
+		log.Fatalf("listen for event callbacks: %v", err)
+	}
+	defer listener.Close()
 	go func() {
-		defer wg.Done()
-		for range time.Tick(HealthCheckInterval * time.Second) {
-			subscribeToEvents()
-		}
-	}()
-
-	// if enabled, pull events periodically
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		if enableEventPull {
-			time.Sleep(5 * time.Second)
-			pullEvents()
-			for range time.Tick(eventPullInterval * time.Second) {
-				pullEvents()
-			}
+		if serveErr := serveCallbacks(server, listener); serveErr != nil && serveErr != http.ErrServerClosed {
+			log.Errorf("event callback server: %v", serveErr)
+			stop()
 		}
 	}()
 
 	log.Info("waiting for events")
-	wg.Wait()
-	deleteAllSubscriptions()
-	time.Sleep(3 * time.Second)
+	runEventLoop(ctx, enableEventPull)
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := server.Shutdown(shutdownCtx); err != nil {
+		log.Errorf("shutdown event callback server: %v", err)
+	}
+}
+
+func runEventLoop(ctx context.Context, enableEventPull bool) {
+	subscribeToEvents(ctx)
+	healthTicker := time.NewTicker(HealthCheckInterval * time.Second)
+	defer healthTicker.Stop()
+
+	// Serialize subscription checks and pulls because both use subscription state.
+	var pull <-chan time.Time
+	var pullTimer *time.Timer
+	if enableEventPull {
+		pullTimer = time.NewTimer(5 * time.Second)
+		defer pullTimer.Stop()
+		pull = pullTimer.C
+	}
+	for ctx.Err() == nil {
+		select {
+		case <-ctx.Done():
+			return
+		case <-healthTicker.C:
+			subscribeToEvents(ctx)
+		case <-pull:
+			pullEvents(ctx)
+			pullTimer.Reset(eventPullInterval * time.Second)
+		}
+	}
 }
 
 // initializeAuthentication initializes the authentication configuration and client
@@ -304,11 +327,11 @@ func getScheme() string {
 	return "http"
 }
 
-func deleteAllSubscriptions() {
+func deleteAllSubscriptions(ctx context.Context) {
 	deleteURL := &types.URI{URL: url.URL{Scheme: getScheme(),
 		Host: apiAddr,
 		Path: apiPath + "subscriptions"}}
-	authenticatedClient.Delete(deleteURL)
+	authenticatedClient.DeleteContext(ctx, deleteURL)
 	for p := range subscribed {
 		subscribed[p] = false
 	}
@@ -316,14 +339,14 @@ func deleteAllSubscriptions() {
 
 // checkSubscriptions gets all subscriptions
 // and returns true if there are any subscriptions
-func checkSubscriptions() bool {
+func checkSubscriptions(ctx context.Context) bool {
 	url := &types.URI{URL: url.URL{Scheme: getScheme(),
 		Host: apiAddr,
 		Path: apiPath + "subscriptions"}}
 
 	var subs = []pubsub.PubSub{}
 	var subB []byte
-	status, subB, err := authenticatedClient.Get(url)
+	status, subB, err := authenticatedClient.GetContext(ctx, url)
 	if status != http.StatusOK {
 		log.Errorf("failed to list subscriptions, status %d", status)
 		if err != nil {
@@ -338,17 +361,20 @@ func checkSubscriptions() bool {
 	return len(subs) > 0
 }
 
-func subscribeToEvents() {
+func subscribeToEvents(ctx context.Context) {
 RETRY:
 	for p, subOK := range subscribed {
-		healthOK := publisherHealthCheck(p)
+		healthOK := publisherHealthCheck(ctx, p)
+		if ctx.Err() != nil {
+			return
+		}
 		if subOK {
 			if !healthOK {
-				deleteAllSubscriptions()
+				deleteAllSubscriptions(ctx)
 				log.Info("delete all subscriptions due to publisher health failure")
 				goto RETRY
 			}
-			if !checkSubscriptions() {
+			if !checkSubscriptions(ctx) {
 				// re-subscribe in case of non-recoverable error at server side, for example
 				// lost of persist data in configmap
 				log.Infof("subscription not found for %s, resubscribe", p)
@@ -362,7 +388,13 @@ RETRY:
 		}
 		allSubscribed := true
 		for _, s := range subs {
-			su, status, e := createSubscription(s.Resource)
+			if ctx.Err() != nil {
+				return
+			}
+			su, status, e := createSubscription(ctx, s.Resource)
+			if ctx.Err() != nil {
+				return
+			}
 			if status == http.StatusConflict {
 				// if subscription for the resource already exist, current O-RAN REST API
 				// does not return subscription info. In order to find out which subscription
@@ -371,7 +403,7 @@ RETRY:
 				// Delete all subscriptions and resubscribe to keep the example code simple.
 				log.Warnf("%s", e)
 				log.Infof("Delete and resubscribe")
-				deleteAllSubscriptions()
+				deleteAllSubscriptions(ctx)
 				goto RETRY
 			} else if e != nil {
 				log.Errorf("failed to create subscription: %v", e)
@@ -389,7 +421,7 @@ RETRY:
 	}
 }
 
-func createSubscription(resourceAddress string) (sub pubsub.PubSub, status int, err error) {
+func createSubscription(ctx context.Context, resourceAddress string) (sub pubsub.PubSub, status int, err error) {
 	subURL := &types.URI{URL: url.URL{Scheme: getScheme(),
 		Host: apiAddr,
 		Path: apiPath + "subscriptions"}}
@@ -407,7 +439,7 @@ func createSubscription(resourceAddress string) (sub pubsub.PubSub, status int, 
 	var subB []byte
 
 	if subB, err = json.Marshal(&sub); err == nil {
-		status, subB = authenticatedClient.PostWithReturn(subURL, subB)
+		status, subB = authenticatedClient.PostWithReturnContext(ctx, subURL, subB)
 		if status == http.StatusCreated {
 			err = json.Unmarshal(subB, &sub)
 		} else {
@@ -423,12 +455,12 @@ func createSubscription(resourceAddress string) (sub pubsub.PubSub, status int, 
 }
 
 // getCurrentState get event state for the resource
-func getCurrentState(resource string) error {
+func getCurrentState(ctx context.Context, resource string) error {
 	//create publisher
 	url := &types.URI{URL: url.URL{Scheme: getScheme(),
 		Host: apiAddr,
 		Path: fmt.Sprintf("%s%s", apiPath, fmt.Sprintf("%s/CurrentState", resource[1:]))}}
-	status, cloudEvent, err := authenticatedClient.Get(url)
+	status, cloudEvent, err := authenticatedClient.GetContext(ctx, url)
 	if status != http.StatusOK {
 		if err != nil {
 			log.Error(err)
@@ -441,7 +473,7 @@ func getCurrentState(resource string) error {
 }
 
 // Consumer webserver
-func server() {
+func newCallbackServer() (*http.Server, error) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/event", getEvent)
 	mux.HandleFunc("/ack/event", ackEvent)
@@ -463,21 +495,21 @@ func server() {
 	if getScheme() == "https" {
 		tlsConfig, err := authConfig.CreateServerTLSConfig()
 		if err != nil {
-			log.Fatalf("failed to create TLS config for callback server: %v", err)
+			return nil, fmt.Errorf("create TLS config for callback server: %w", err)
 		}
 		server.TLSConfig = tlsConfig
-		log.Infof("Starting local API (HTTPS, mTLS) listening to %s", port)
-		// Certs are supplied via server.TLSConfig.Certificates.
-		if err = server.ListenAndServeTLS("", ""); err != nil {
-			log.Errorf("error creating event server %s", err)
-		}
-		return
 	}
+	return server, nil
+}
 
-	log.Infof("Starting local API listening to %s", port)
-	if err := server.ListenAndServe(); err != nil {
-		log.Errorf("error creating event server %s", err)
+func serveCallbacks(server *http.Server, listener net.Listener) error {
+	if server.TLSConfig != nil {
+		log.Infof("Starting local API (HTTPS, mTLS) listening on %s", listener.Addr())
+		// The certificate and key are supplied in the TLS config.
+		return server.ServeTLS(listener, "", "")
 	}
+	log.Infof("Starting local API listening on %s", listener.Addr())
+	return server.Serve(listener)
 }
 
 func getEvent(w http.ResponseWriter, req *http.Request) {
@@ -602,7 +634,7 @@ func getUUID(s string) uuid.UUID {
 	return uuid.NewMD5(namespace, url)
 }
 
-func pullEvents() {
+func pullEvents(ctx context.Context) {
 	for _, subOK := range subscribed {
 		if !subOK {
 			log.Info("skipping getCurrentState() since publisher not available")
@@ -610,32 +642,40 @@ func pullEvents() {
 		}
 	}
 	for _, s := range subs {
-		if err := getCurrentState(s.Resource); err != nil {
+		if ctx.Err() != nil {
+			return
+		}
+		if err := getCurrentState(ctx, s.Resource); err != nil && ctx.Err() == nil {
 			log.Error(err)
 		}
 	}
 }
 
-func publisherHealthCheck(apiAddr string) bool {
+func publisherHealthCheck(ctx context.Context, apiAddr string) bool {
 	healthURL := &types.URI{URL: url.URL{Scheme: getScheme(),
 		Host: apiAddr,
 		Path: apiPath + "health"}}
 
 	// Use authenticated client for health checks when authentication is enabled
-	for i := 0; i <= 5; i++ {
+	for i := 0; i <= 5 && ctx.Err() == nil; i++ {
 		log.Infof("health check %s", healthURL.String())
-		status, _, err := authenticatedClient.Get(healthURL)
-		if err != nil {
-			log.Warnf("try %d, return health check of the rest service for error %v", i, err)
-			time.Sleep(HealthCheckRetryInterval * time.Second)
-			continue
-		}
+		status, _, err := authenticatedClient.GetContext(ctx, healthURL)
 		if status == http.StatusOK {
 			log.Info("rest service returned healthy status")
 			return true
 		}
-		log.Warnf("try %d, health check returned status %d", i, status)
-		time.Sleep(HealthCheckRetryInterval * time.Second)
+		if ctx.Err() != nil {
+			return false
+		}
+		log.Warnf("try %d, health check returned status %d (error: %v)", i, status, err)
+		if i < 5 {
+			timer := time.NewTimer(HealthCheckRetryInterval * time.Second)
+			select {
+			case <-ctx.Done():
+			case <-timer.C:
+			}
+			timer.Stop()
+		}
 	}
 	return false
 }

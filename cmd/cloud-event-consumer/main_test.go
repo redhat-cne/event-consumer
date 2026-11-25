@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/redhat-cne/event-consumer/pkg/auth"
 	"github.com/redhat-cne/event-consumer/pkg/restclient"
@@ -71,6 +72,42 @@ func TestPrettyEventJSON(t *testing.T) {
 	invalid := []byte("not-json")
 	if got := prettyEventJSON(invalid); got != string(invalid) {
 		t.Fatalf("invalid JSON changed: %q", got)
+	}
+}
+
+func TestEventLoopCancelsInFlightHealthCheck(t *testing.T) {
+	started := make(chan struct{}, 1)
+	publisher := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		started <- struct{}{}
+		<-r.Context().Done()
+	}))
+	defer publisher.Close()
+
+	oldSubscribed, oldClient, oldConfig := subscribed, authenticatedClient, authConfig
+	t.Cleanup(func() {
+		subscribed, authenticatedClient, authConfig = oldSubscribed, oldClient, oldConfig
+	})
+	subscribed = map[string]bool{strings.TrimPrefix(publisher.URL, "http://"): false}
+	authenticatedClient = restclient.New()
+	authConfig = nil
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		runEventLoop(ctx, false)
+	}()
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("health check did not start")
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("event loop did not stop after cancellation")
 	}
 }
 
@@ -153,7 +190,7 @@ func TestCEPv2SubscriptionWireCompatibility(t *testing.T) {
 	localAPIAddr = "consumer.example:9043"
 	authenticatedClient = restclient.New()
 	authConfig = nil
-	sub, status, err := createSubscription(resource)
+	sub, status, err := createSubscription(t.Context(), resource)
 	if err != nil || status != 201 || sub.ID != "test-id" {
 		t.Fatalf("subscription: %+v status=%d error=%v", sub, status, err)
 	}
