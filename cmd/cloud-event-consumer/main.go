@@ -20,6 +20,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"maps"
 	"net"
 	"net/http"
 	"net/url"
@@ -73,6 +74,7 @@ var (
 	mockResourceKey    = "mock"
 	httpEventPublisher string
 	authConfigPath     string
+	multilineEvents    bool
 	// map to track if subscriptions were created successfully for each publisher service
 	subscribed = make(map[string]bool)
 	subs       []*pubsub.PubSub
@@ -90,6 +92,11 @@ var (
 func main() {
 	fmt.Printf("Git commit: %s\n", GitCommit)
 	common.InitLogger()
+	multilineEvents = common.GetBoolEnv("MULTILINE_EVENTS")
+	if multilineEvents {
+		logger := log.StandardLogger()
+		logger.SetFormatter(eventLogFormatter{Formatter: logger.Formatter})
+	}
 	flag.StringVar(&localAPIAddr, "local-api-addr", "localhost:8989", "The address the local api binds to .")
 	flag.StringVar(&apiPath, "api-path", "/api/ocloudNotifications/v2/", "The rest api path.")
 	flag.StringVar(&apiAddr, "api-addr", "", "Obsolete. The publisher API address is retrieved from httpEventPublisher flag")
@@ -428,7 +435,7 @@ func getCurrentState(resource string) error {
 		}
 		return fmt.Errorf("CurrentState: error %d from url %s", status, url.String())
 	} else {
-		log.Debugf("Got CurrentState:\n%s", prettyEventJSON(cloudEvent))
+		logEvent(log.DebugLevel, "Got CurrentState", cloudEvent)
 	}
 	return nil
 }
@@ -503,6 +510,43 @@ func ackEvent(w http.ResponseWriter, req *http.Request) {
 	}
 }
 
+const eventPayloadField = "_event_payload"
+
+// eventLogFormatter keeps the usual log header and appends the indented JSON
+// only for event entries. Logrus writes the complete entry in one call.
+type eventLogFormatter struct {
+	log.Formatter
+}
+
+func (f eventLogFormatter) Format(entry *log.Entry) ([]byte, error) {
+	payload, ok := entry.Data[eventPayloadField].(string)
+	if !ok {
+		return f.Formatter.Format(entry)
+	}
+	header := *entry
+	header.Data = maps.Clone(entry.Data)
+	delete(header.Data, eventPayloadField)
+	formatted, err := f.Formatter.Format(&header)
+	if err != nil {
+		return nil, err
+	}
+	formatted = append(formatted, payload...)
+	return append(formatted, '\n'), nil
+}
+
+func logEvent(level log.Level, message string, data []byte) {
+	if !log.IsLevelEnabled(level) {
+		return
+	}
+	payload := prettyEventJSON(data)
+	// Keep malformed payloads in the normal quoted log format.
+	if multilineEvents && json.Valid(data) {
+		log.WithField(eventPayloadField, payload).Log(level, message)
+		return
+	}
+	log.StandardLogger().Logf(level, "%s:\n%s", message, payload)
+}
+
 func prettyEventJSON(data []byte) string {
 	var pretty bytes.Buffer
 	trimmed := bytes.TrimSpace(data)
@@ -525,7 +569,7 @@ func processEvent(data []byte) error {
 	latencyUs := time.Now().UnixMicro() - e.Context.GetTime().UnixMicro()
 	// set log to Info level for performance measurement
 	log.Infof("Latency for the event: %d us (%.3f ms)", latencyUs, float64(latencyUs)/1000.0)
-	log.Infof("received event %s: '%s'", e.ID(), prettyEventJSON(data))
+	logEvent(log.InfoLevel, "received event "+e.ID(), data)
 	return nil
 }
 

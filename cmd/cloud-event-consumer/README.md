@@ -91,6 +91,9 @@ Authentication is configured using a JSON configuration file. The configuration 
 - `NODE_IP`: Node IP address
 - `CONSUMER_TYPE`: Consumer type (PTP, HW, MOCK)
 - `ENABLE_STATUS_CHECK`: Enable periodic status checks
+- `MULTILINE_EVENTS=true`: Print pushed events and pulled `CurrentState`
+  responses as indented JSON on separate lines for demos. Other messages retain
+  their usual format. Set `LOG_LEVEL=debug` to include `CurrentState` responses.
 
 ## Examples
 

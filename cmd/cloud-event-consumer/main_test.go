@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/redhat-cne/event-consumer/pkg/auth"
 	"github.com/redhat-cne/event-consumer/pkg/restclient"
+	log "github.com/sirupsen/logrus"
 )
 
 type callbackTestValidator struct{}
@@ -69,6 +71,55 @@ func TestPrettyEventJSON(t *testing.T) {
 	invalid := []byte("not-json")
 	if got := prettyEventJSON(invalid); got != string(invalid) {
 		t.Fatalf("invalid JSON changed: %q", got)
+	}
+}
+
+func TestEventLogFormatting(t *testing.T) {
+	logger := log.StandardLogger()
+	oldOutput, oldFormatter, oldLevel := logger.Out, logger.Formatter, logger.GetLevel()
+	oldMultiline := multilineEvents
+	t.Cleanup(func() {
+		logger.SetOutput(oldOutput)
+		logger.SetFormatter(oldFormatter)
+		logger.SetLevel(oldLevel)
+		multilineEvents = oldMultiline
+	})
+
+	var output bytes.Buffer
+	logger.SetOutput(&output)
+	logger.SetLevel(log.DebugLevel)
+	formatter := &log.TextFormatter{DisableColors: true}
+	logger.SetFormatter(formatter)
+	multilineEvents = false
+	payload := []byte(`{"id":"event-1"}`)
+	logEvent(log.InfoLevel, "received event event-1", payload)
+	if got := output.String(); strings.Count(got, "\n") != 1 || !strings.Contains(got, `\n`) {
+		t.Fatalf("expected an escaped, single-line event, got %q", got)
+	}
+
+	logger.SetFormatter(eventLogFormatter{Formatter: formatter})
+	multilineEvents = true
+	for _, event := range []struct {
+		level   log.Level
+		message string
+	}{
+		{log.DebugLevel, "Got CurrentState"},
+		{log.InfoLevel, "received event event-1"},
+	} {
+		output.Reset()
+		logEvent(event.level, event.message, payload)
+		got := output.String()
+		header := fmt.Sprintf(`level=%s msg="%s"`, event.level, event.message)
+		if !strings.Contains(got, header+"\n{\n  \"id\": \"event-1\"\n}\n") {
+			t.Errorf("expected a log header and indented event, got %q", got)
+		}
+	}
+
+	output.Reset()
+	log.Info("ordinary log")
+	logEvent(log.DebugLevel, "malformed payload", []byte("invalid\nJSON"))
+	if got := output.String(); strings.Count(got, "\n") != 2 || !strings.Contains(got, `invalid\nJSON`) {
+		t.Fatalf("expected ordinary and malformed messages to stay single-line, got %q", got)
 	}
 }
 
