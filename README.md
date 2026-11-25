@@ -13,6 +13,36 @@ make docker-build docker-push CONSUMER_IMG=quay.io/your-account/cloud-event-cons
 make deploy-consumer SECURED=true CONSUMER_IMG=quay.io/your-account/cloud-event-consumer:dev
 ```
 
+## Multiline event logs
+
+`MULTILINE_EVENTS` controls whether pushed events and pulled `CurrentState`
+responses are printed as indented, multiline JSON. It is disabled by default.
+Enable it on an existing deployment and roll out only the consumer:
+
+```sh
+oc -n cloud-events set env deployment/cloud-consumer-deployment MULTILINE_EVENTS=true
+oc -n cloud-events rollout status deployment/cloud-consumer-deployment
+```
+
+Set `LOG_LEVEL=debug` as well if pulled `CurrentState` responses should appear:
+
+```sh
+oc -n cloud-events set env deployment/cloud-consumer-deployment \
+  MULTILINE_EVENTS=true LOG_LEVEL=debug
+oc -n cloud-events rollout status deployment/cloud-consumer-deployment
+```
+
+Disable multiline output by removing the environment variable, which restores
+the default single-line log format:
+
+```sh
+oc -n cloud-events set env deployment/cloud-consumer-deployment MULTILINE_EVENTS-
+oc -n cloud-events rollout status deployment/cloud-consumer-deployment
+```
+
+These commands update only the consumer Deployment; they do not restart the
+linuxptp-daemon pod or the event publisher.
+
 Deployments initially default to plaintext for compatibility. Set SECURED=true
 for full mTLS and OAuth. Use the same JSON options as CEPv1:
 enableMTLS, enableOAuth, requiredAudiences, certificate paths, service account
