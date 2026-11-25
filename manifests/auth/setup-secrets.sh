@@ -118,6 +118,32 @@ restart_and_wait() {
     oc rollout status "$resource" -n "$namespace" --timeout="$ROLLOUT_TIMEOUT"
 }
 
+# Probe with the newly provisioned credentials. The Secret update can reach the
+# running consumer before or after the publisher reloads its client CA.
+publisher_auth_ready() {
+    oc --request-timeout=10s exec "deployment/$CONSUMER_DEPLOYMENT" -n "$NAMESPACE" \
+        -c cloud-event-consumer -- sh -ec '
+        auth_dir=/etc/cloud-event-consumer
+        cert="$auth_dir/client-certs/tls.crt"
+        fingerprint=$(sha256sum "$cert")
+        [ "${fingerprint%% *}" = "$1" ] || exit 1
+
+        url=$2
+        if [ -z "$url" ]; then
+            node=${NODE_NAME%%.*}
+            url="https://ptp-event-publisher-service-$node.$3.svc.cluster.local:9043/api/ocloudNotifications/v2/subscriptions"
+        fi
+        token=$(cat /var/run/event-api-token/token)
+        # Feed the bearer header through stdin to keep it out of process arguments.
+        status=$(printf "Authorization: Bearer %s\n" "$token" |
+            curl --silent --show-error --max-time 5 --proto "=https" \
+                --cacert "$auth_dir/ca-bundle/service-ca.crt" \
+                --cert "$cert" --key "$auth_dir/client-certs/tls.key" \
+                --header @- --output /dev/null --write-out "%{http_code}" "$url")
+        [ "$status" = 200 ]
+    ' sh "$1" "${PUBLISHER_AUTH_URL:-}" "$PUBLISHER_NAMESPACE"
+}
+
 ########################################
 # 1. consumer client certificate (mTLS to the publisher)
 ########################################
@@ -283,7 +309,10 @@ echo "✓ consumer-auth-config ConfigMap created"
 if [ "$CEP_VERSION" = "1" ]; then
     restart_and_wait "daemonset/$PUBLISHER_DAEMONSET" "$PUBLISHER_NAMESPACE"
 else
-    echo "CEPv2 publisher reloads projected TLS material in place; the consumer retries subscriptions during propagation."
+    consumer_cert_sha256="$(oc get secret consumer-client-certs -n "$NAMESPACE" \
+        -o jsonpath='{.data.tls\.crt}' | base64 -d | openssl dgst -sha256 -r)"
+    wait_for "CEPv2 publisher accepts the new consumer credentials" \
+        publisher_auth_ready "${consumer_cert_sha256%% *}"
 fi
 restart_and_wait "deployment/$CONSUMER_DEPLOYMENT" "$NAMESPACE"
 

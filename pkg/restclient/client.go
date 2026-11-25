@@ -166,6 +166,12 @@ func (r *Rest) PostWithReturn(url *types.URI, data []byte) (int, []byte) {
 	if readErr != nil {
 		return http.StatusBadRequest, nil
 	}
+	if r.authClient != nil && res.StatusCode == http.StatusUnauthorized {
+		// The publisher may have reloaded its client CA since this TLS
+		// connection was opened. Drain the idle pool after reading the
+		// response so the next subscription attempt negotiates TLS again.
+		r.authClient.GetClient().CloseIdleConnections()
+	}
 	return res.StatusCode, body
 }
 

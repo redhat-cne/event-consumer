@@ -27,8 +27,10 @@ Secured deployment performs these steps:
 5. Creates a static authentication ConfigMap using `requiredAudiences`.
 
 The setup defaults to `CEP_VERSION=2` and expects a CEPv2 publisher image with
-live TLS reload. It restarts the consumer Deployment for its own credential
-changes. Subscription retries cover the publisher's volume propagation delay.
+live TLS reload. Before restarting the consumer for its own credential changes,
+setup waits for a fresh authenticated `GET /subscriptions` using the new client
+certificate. Set `PUBLISHER_AUTH_URL` to the full HTTPS subscriptions URL when
+using a publisher address or API path different from the secured overlay defaults.
 For a CEPv1 publisher, pass `CEP_VERSION=1` to retain the publisher rollout.
 
 There are no cluster-specific OAuth issuer or JWKS URLs. `CLUSTER_NAME` is not
