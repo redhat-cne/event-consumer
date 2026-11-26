@@ -172,7 +172,8 @@ func runEventLoop(ctx context.Context, subscribe, enableEventPull bool) {
 		<-ctx.Done()
 		return
 	}
-	for !subscribeToEvents(ctx) {
+	conflicts := make(map[string]bool)
+	for !subscribeToEvents(ctx, conflicts) {
 		timer := time.NewTimer(subscriptionRetryInterval)
 		select {
 		case <-ctx.Done():
@@ -316,16 +317,27 @@ func getScheme() string {
 	return "http"
 }
 
-func subscribeToEvents(ctx context.Context) bool {
+func subscribeToEvents(ctx context.Context, conflicts map[string]bool) bool {
 	allSubscribed := true
 	for _, sub := range subs {
 		if ctx.Err() != nil {
 			return false
 		}
-		if sub.ID != "" {
+		if sub.ID != "" || conflicts[sub.Resource] {
 			continue
 		}
-		created, _, err := createSubscription(ctx, sub.Resource)
+		created, status, err := createSubscription(ctx, sub.Resource)
+		if status == http.StatusConflict {
+			conflicts[sub.Resource] = true
+			log.Infof("Subscription already exists for %s", sub.Resource)
+			status, body, err := authenticatedClient.GetContext(ctx, subscriptionsURL())
+			if err != nil || status != http.StatusOK {
+				log.Warnf("Could not list current subscriptions: HTTP %d (error: %v)", status, err)
+			} else {
+				log.Infof("Current subscriptions: %s", body)
+			}
+			continue
+		}
 		if err != nil {
 			log.Errorf("failed to create subscription: %v", err)
 			allSubscribed = false
@@ -342,10 +354,14 @@ func subscribeToEvents(ctx context.Context) bool {
 	return allSubscribed
 }
 
-func createSubscription(ctx context.Context, resourceAddress string) (sub pubsub.PubSub, status int, err error) {
-	subURL := &types.URI{URL: url.URL{Scheme: getScheme(),
+func subscriptionsURL() *types.URI {
+	return &types.URI{URL: url.URL{Scheme: getScheme(),
 		Host: apiAddr,
 		Path: apiPath + "subscriptions"}}
+}
+
+func createSubscription(ctx context.Context, resourceAddress string) (sub pubsub.PubSub, status int, err error) {
+	subURL := subscriptionsURL()
 	// Register the callback EndpointURI with the same scheme used for outbound
 	// calls: https:// when authentication is enabled. Per O-RAN CR-0003 clause
 	// 4.1.1 a callback reachable from a separate POD/VM must be protected by an
