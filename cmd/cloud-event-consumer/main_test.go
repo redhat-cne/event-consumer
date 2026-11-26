@@ -1,12 +1,12 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -15,7 +15,7 @@ import (
 
 	"github.com/redhat-cne/event-consumer/pkg/auth"
 	"github.com/redhat-cne/event-consumer/pkg/restclient"
-	log "github.com/sirupsen/logrus"
+	"github.com/redhat-cne/sdk-go/pkg/pubsub"
 )
 
 type callbackTestValidator struct{}
@@ -62,32 +62,23 @@ func TestCallbackRequiresEnabledCredentials(t *testing.T) {
 	}
 }
 
-func TestPrettyEventJSON(t *testing.T) {
-	raw := []byte(` {"specversion":"1.0","id":"event-1","data":{"value":42}} `)
-	want := "{\n  \"specversion\": \"1.0\",\n  \"id\": \"event-1\",\n  \"data\": {\n    \"value\": 42\n  }\n}"
-	if got := prettyEventJSON(raw); got != want {
-		t.Fatalf("pretty event:\n%s\nwant:\n%s", got, want)
-	}
-
-	invalid := []byte("not-json")
-	if got := prettyEventJSON(invalid); got != string(invalid) {
-		t.Fatalf("invalid JSON changed: %q", got)
-	}
-}
-
-func TestEventLoopCancelsInFlightHealthCheck(t *testing.T) {
+func TestEventLoopCancelsInFlightSubscription(t *testing.T) {
 	started := make(chan struct{}, 1)
 	publisher := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
 		started <- struct{}{}
 		<-r.Context().Done()
 	}))
 	defer publisher.Close()
 
-	oldSubscribed, oldClient, oldConfig := subscribed, authenticatedClient, authConfig
+	oldSubs, oldClient, oldConfig := subs, authenticatedClient, authConfig
 	t.Cleanup(func() {
-		subscribed, authenticatedClient, authConfig = oldSubscribed, oldClient, oldConfig
+		subs, authenticatedClient, authConfig = oldSubs, oldClient, oldConfig
 	})
-	subscribed = map[string]bool{strings.TrimPrefix(publisher.URL, "http://"): false}
+	subs = []*pubsub.PubSub{{Resource: "/demo"}}
+	oldAddr := apiAddr
+	t.Cleanup(func() { apiAddr = oldAddr })
+	apiAddr = strings.TrimPrefix(publisher.URL, "http://")
 	authenticatedClient = restclient.New()
 	authConfig = nil
 
@@ -96,67 +87,18 @@ func TestEventLoopCancelsInFlightHealthCheck(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		runEventLoop(ctx, false)
+		runEventLoop(ctx, true, false)
 	}()
 	select {
 	case <-started:
 	case <-time.After(5 * time.Second):
-		t.Fatal("health check did not start")
+		t.Fatal("subscription did not start")
 	}
 	cancel()
 	select {
 	case <-done:
 	case <-time.After(5 * time.Second):
 		t.Fatal("event loop did not stop after cancellation")
-	}
-}
-
-func TestEventLogFormatting(t *testing.T) {
-	logger := log.StandardLogger()
-	oldOutput, oldFormatter, oldLevel := logger.Out, logger.Formatter, logger.GetLevel()
-	oldMultiline := multilineEvents
-	t.Cleanup(func() {
-		logger.SetOutput(oldOutput)
-		logger.SetFormatter(oldFormatter)
-		logger.SetLevel(oldLevel)
-		multilineEvents = oldMultiline
-	})
-
-	var output bytes.Buffer
-	logger.SetOutput(&output)
-	logger.SetLevel(log.DebugLevel)
-	formatter := &log.TextFormatter{DisableColors: true}
-	logger.SetFormatter(formatter)
-	multilineEvents = false
-	payload := []byte(`{"id":"event-1"}`)
-	logEvent(log.InfoLevel, "received event event-1", payload)
-	if got := output.String(); strings.Count(got, "\n") != 1 || !strings.Contains(got, `\n`) {
-		t.Fatalf("expected an escaped, single-line event, got %q", got)
-	}
-
-	logger.SetFormatter(eventLogFormatter{Formatter: formatter})
-	multilineEvents = true
-	for _, event := range []struct {
-		level   log.Level
-		message string
-	}{
-		{log.DebugLevel, "Got CurrentState"},
-		{log.InfoLevel, "received event event-1"},
-	} {
-		output.Reset()
-		logEvent(event.level, event.message, payload)
-		got := output.String()
-		header := fmt.Sprintf(`level=%s msg="%s"`, event.level, event.message)
-		if !strings.Contains(got, header+"\n{\n  \"id\": \"event-1\"\n}\n") {
-			t.Errorf("expected a log header and indented event, got %q", got)
-		}
-	}
-
-	output.Reset()
-	log.Info("ordinary log")
-	logEvent(log.DebugLevel, "malformed payload", []byte("invalid\nJSON"))
-	if got := output.String(); strings.Count(got, "\n") != 2 || !strings.Contains(got, `invalid\nJSON`) {
-		t.Fatalf("expected ordinary and malformed messages to stay single-line, got %q", got)
 	}
 }
 
